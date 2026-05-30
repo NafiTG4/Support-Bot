@@ -17,6 +17,7 @@ Env vars: BOT_TOKEN, SUPPORT_GROUP_ID, BUG_FEATURE_GROUP_ID, DB_PATH (optional)
 
 import csv
 import io
+import asyncio
 import os
 import sqlite3
 import logging
@@ -58,6 +59,16 @@ BUG_FEATURE_GROUP_ID = int(os.environ["BUG_FEATURE_GROUP_ID"])
 DB_PATH            = os.environ.get("DB_PATH", "blockveil_support.db")
 
 # ---------------------------------------------------------------------------
+# Maintenance & Broadcast state
+# ---------------------------------------------------------------------------
+
+# In-memory maintenance flag (loaded from DB on startup, persisted on change)
+_maintenance_on: bool = False
+
+# Per-chat pending state for admin text-input flows (broadcast, set message, etc.)
+_admin_pending: dict = {}   # chat_id -> {"step": str, ...}
+
+# ---------------------------------------------------------------------------
 # Conversation States  (user-side)
 # ---------------------------------------------------------------------------
 (
@@ -88,7 +99,10 @@ DB_PATH            = os.environ.get("DB_PATH", "blockveil_support.db")
     ADMIN_FAQ_DETAIL,
     ADMIN_FAQ_EDIT_Q,
     ADMIN_FAQ_EDIT_A,
-) = range(20, 31)
+    ADMIN_MAINTENANCE_MSG,
+    ADMIN_BROADCAST,
+    ADMIN_BROADCAST_MSG,
+) = range(20, 34)
 
 TYPE_SUPPORT = "support"
 TYPE_BUG     = "bug"
@@ -162,7 +176,15 @@ def init_db() -> None:
                 started_at TEXT    NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         conn.commit()
+    # Load persisted maintenance state into memory
+    _load_maintenance_state()
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -380,6 +402,68 @@ def export_users_csv() -> bytes:
         ])
     return buf.getvalue().encode("utf-8")
 
+
+# --- Maintenance setting helpers ---
+def _load_maintenance_state() -> None:
+    """Load maintenance flag from DB into memory."""
+    global _maintenance_on
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key = 'maintenance'",
+        ).fetchone()
+    _maintenance_on = (row["value"] == "1") if row else False
+
+
+def _save_maintenance_state(value: bool) -> None:
+    global _maintenance_on
+    _maintenance_on = value
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO bot_settings (key, value) VALUES ('maintenance', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("1" if value else "0",),
+        )
+        conn.commit()
+
+
+def is_maintenance() -> bool:
+    return _maintenance_on
+
+
+def get_maintenance_message() -> str:
+    """Return admin-set maintenance message or a sensible default."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key = 'maintenance_message'",
+        ).fetchone()
+    if row and row["value"]:
+        return row["value"]
+    return (
+        "🔧 *BlockVeil Support is under maintenance.*\n\n"
+        "We are making improvements to serve you better.\n"
+        "Please check back soon. Thank you for your patience!"
+    )
+
+
+def save_maintenance_message(text: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO bot_settings (key, value) VALUES ('maintenance_message', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (text,),
+        )
+        conn.commit()
+
+
+# --- Broadcast helper ---
+async def auto_delete_msg(message, delay: int = 30) -> None:
+    """Delete a message after `delay` seconds. Used to keep the admin group clean."""
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -592,6 +676,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     user = update.effective_user
     upsert_user(user)
+
+    # Block users when maintenance is active
+    if is_maintenance():
+        await update.message.reply_text(
+            get_maintenance_message(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
         f"👋 *Welcome to BlockVeil Support, {user.first_name}!*\n\n"
         "We are here to help you. Select an option below:",
@@ -720,25 +813,19 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # --- Maintenance ---
     if data == "adm_maintenance":
-        await query.edit_message_text(
-            "🔧 *Maintenance*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Maintenance mode controls are coming soon.\n"
-            "When enabled, users will see a maintenance notice instead of the menu.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=make_admin_back_keyboard(),
-        )
-        return ADMIN_DASHBOARD
+        return await adm_maintenance_cb(update, context)
+
+    # --- Maintenance toggle ---
+    if data == "adm_maintenance_toggle":
+        return await adm_maintenance_toggle_cb(update, context)
+
+    # --- Maintenance set message ---
+    if data == "adm_maintenance_set_msg":
+        return await adm_maintenance_set_msg_cb(update, context)
 
     # --- Broadcast ---
     if data == "adm_broadcast":
-        await query.edit_message_text(
-            "📢 *Broadcast*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Broadcast messaging is coming soon.\n"
-            "You will be able to send a message to all registered users at once.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=make_admin_back_keyboard(),
-        )
-        return ADMIN_DASHBOARD
+        return await adm_broadcast_cb(update, context)
 
     # --- User Control ---
     if data == "adm_user_control":
@@ -1133,6 +1220,368 @@ async def admin_faq_edit_answer(update: Update, context: ContextTypes.DEFAULT_TY
         ]),
     )
     return ADMIN_FAQ_LIST
+
+# ---------------------------------------------------------------------------
+# Admin: Maintenance
+# ---------------------------------------------------------------------------
+
+async def adm_maintenance_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show maintenance status with toggle + set message button."""
+    query = update.callback_query
+    await query.answer()
+    on = is_maintenance()
+    status = "🔴 *Maintenance Mode: ON*\n\nAll users are currently blocked." if on \
+             else "✅ *Maintenance Mode: OFF*\n\nBot is live for all users."
+    toggle_label = "🟢 Turn OFF Maintenance" if on else "🔴 Turn ON Maintenance"
+    await query.edit_message_text(
+        f"🔧 *Maintenance*\n━━━━━━━━━━━━━━━━━━━━\n\n{status}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label,             callback_data="adm_maintenance_toggle")],
+            [InlineKeyboardButton("✉️ Set Maintenance Message", callback_data="adm_maintenance_set_msg")],
+            [InlineKeyboardButton("⬅️ Back to Dashboard",   callback_data="adm_back_dash")],
+        ]),
+    )
+    return ADMIN_DASHBOARD
+
+
+async def adm_maintenance_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Toggle maintenance on/off."""
+    query = update.callback_query
+    await query.answer()
+    new_state = not is_maintenance()
+    _save_maintenance_state(new_state)
+    on = new_state
+    status = "🔴 *Maintenance Mode: ON*\n\nAll users are currently blocked." if on \
+             else "✅ *Maintenance Mode: OFF*\n\nBot is live for all users."
+    toggle_label = "🟢 Turn OFF Maintenance" if on else "🔴 Turn ON Maintenance"
+    await query.edit_message_text(
+        f"🔧 *Maintenance*\n━━━━━━━━━━━━━━━━━━━━\n\n{status}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(toggle_label,             callback_data="adm_maintenance_toggle")],
+            [InlineKeyboardButton("✉️ Set Maintenance Message", callback_data="adm_maintenance_set_msg")],
+            [InlineKeyboardButton("⬅️ Back to Dashboard",   callback_data="adm_back_dash")],
+        ]),
+    )
+    return ADMIN_DASHBOARD
+
+
+async def adm_maintenance_set_msg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask admin to type the new maintenance message."""
+    query = update.callback_query
+    await query.answer()
+    _admin_pending[update.effective_chat.id] = {"step": "maintenance_msg_wait"}
+    await query.edit_message_text(
+        "✉️ *Set Maintenance Message*\n\n"
+        "Send the message you want users to see when maintenance is ON.\n\n"
+        "_Markdown formatting is supported._",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="adm_maintenance")
+        ]]),
+    )
+    return ADMIN_MAINTENANCE_MSG
+
+
+# ---------------------------------------------------------------------------
+# Admin: Broadcast
+# ---------------------------------------------------------------------------
+
+def _bc_menu_kb(mode: str, has_inline: bool = False) -> InlineKeyboardMarkup:
+    """Keyboard shown after admin sends the broadcast message (before sending)."""
+    rows = [
+        [InlineKeyboardButton("➕ Add Inline Button", callback_data=f"adm_bc_add_inline_{mode}")],
+    ]
+    if has_inline:
+        rows.append([InlineKeyboardButton("📤 Send", callback_data=f"adm_bc_send_{mode}")])
+    else:
+        rows.append([InlineKeyboardButton("📤 Send Directly", callback_data=f"adm_bc_send_{mode}")])
+    rows.append([InlineKeyboardButton("🏠 Dashboard", callback_data="adm_back_dash")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def adm_broadcast_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Broadcast entry: choose type."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "📢 *Broadcast*\n━━━━━━━━━━━━━━━━━━━━\n\nChoose broadcast type:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Public Broadcast",        callback_data="adm_bc_public")],
+            [InlineKeyboardButton("👤 Specific User",           callback_data="adm_bc_specific")],
+            [InlineKeyboardButton("⬅️ Back to Dashboard",       callback_data="adm_back_dash")],
+        ]),
+    )
+    return ADMIN_BROADCAST
+
+
+async def adm_bc_public_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Public broadcast: wait for admin to send the message."""
+    query = update.callback_query
+    await query.answer()
+    _admin_pending[update.effective_chat.id] = {"step": "adm_bc_msg_wait", "mode": "public"}
+    await query.edit_message_text(
+        "📢 *Public Broadcast*\n\nSend the message you want to broadcast to all users.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADMIN_BROADCAST_MSG
+
+
+async def adm_bc_specific_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Specific user broadcast: ask for user ID first."""
+    query = update.callback_query
+    await query.answer()
+    _admin_pending[update.effective_chat.id] = {"step": "adm_bc_specific_id_wait"}
+    await query.edit_message_text(
+        "👤 *Specific User Broadcast*\n\nSend the Telegram User ID of the target user.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADMIN_BROADCAST_MSG
+
+
+async def adm_bc_add_inline_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin clicked Add Inline Button: ask for button name."""
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.replace("adm_bc_add_inline_", "")
+    pending = _admin_pending.get(update.effective_chat.id, {})
+    buttons = pending.get("inline_buttons", [])
+    if len(buttons) >= 5:
+        await query.answer("Maximum 5 inline buttons allowed.", show_alert=True)
+        return ADMIN_BROADCAST_MSG
+    pending["step"]          = "adm_bc_inline_name_wait"
+    pending["mode"]          = mode
+    _admin_pending[update.effective_chat.id] = pending
+    await query.edit_message_text(
+        f"➕ *Add Inline Button* ({len(buttons)}/5)\n\nSend the button label text.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ADMIN_BROADCAST_MSG
+
+
+async def adm_bc_send_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin clicked Send: broadcast the stored message."""
+    query = update.callback_query
+    await query.answer()
+    mode    = query.data.replace("adm_bc_send_", "")
+    chat_id = update.effective_chat.id
+    pending = _admin_pending.pop(chat_id, {})
+    bc_chat = pending.get("bc_chat_id")
+    bc_msg  = pending.get("bc_msg_id")
+    inline_buttons = pending.get("inline_buttons", [])
+
+    if not bc_chat or not bc_msg:
+        await query.edit_message_text(
+            "No broadcast message stored. Please start again.",
+            reply_markup=make_admin_back_keyboard(),
+        )
+        return ADMIN_DASHBOARD
+
+    bc_kb = None
+    if inline_buttons:
+        bc_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(text=btn["text"], url=btn["url"])]
+            for btn in inline_buttons
+        ])
+
+    # Specific user send
+    if mode == "specific":
+        target_id = pending.get("target_tid")
+        if not target_id:
+            await query.edit_message_text(
+                "Target user not found. Please start again.",
+                reply_markup=make_admin_back_keyboard(),
+            )
+            return ADMIN_DASHBOARD
+        try:
+            await context.bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=bc_chat,
+                message_id=bc_msg,
+                reply_markup=bc_kb,
+            )
+            await query.edit_message_text(
+                f"✅ Message sent to user `{target_id}`.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=make_admin_back_keyboard(),
+            )
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Failed to send: {e}",
+                reply_markup=make_admin_back_keyboard(),
+            )
+        return ADMIN_DASHBOARD
+
+    # Public: send to all users
+    all_users = get_all_users()
+    total     = len(all_users)
+    sent = failed = 0
+    failed_ids: list[int] = []
+
+    progress = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"📢 Broadcasting to {total} user(s)... please wait.",
+    )
+    for u in all_users:
+        tid = u["user_id"]
+        try:
+            await context.bot.copy_message(
+                chat_id=tid,
+                from_chat_id=bc_chat,
+                message_id=bc_msg,
+                reply_markup=bc_kb,
+            )
+            sent += 1
+            await asyncio.sleep(0.05)   # respect Telegram rate limits
+        except Exception:
+            failed += 1
+            failed_ids.append(tid)
+
+    try:
+        await progress.delete()
+    except Exception:
+        pass
+
+    summary = (
+        f"📢 *Broadcast Complete!*\n\n"
+        f"✅ Sent:   {sent}\n"
+        f"❌ Failed: {failed}\n"
+        f"👥 Total:  {total}"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=summary, parse_mode=ParseMode.MARKDOWN)
+
+    if failed_ids:
+        lines   = "\n".join(str(tid) for tid in failed_ids)
+        header  = f"Broadcast Failed IDs\nTotal: {failed}\n{'='*30}\n"
+        bio     = io.BytesIO((header + lines + "\n").encode("utf-8"))
+        bio.name = "broadcast_failed.txt"
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=bio,
+            filename="broadcast_failed.txt",
+            caption=f"⚠️ {failed} user(s) could not be reached.",
+        )
+    return ADMIN_DASHBOARD
+
+
+async def admin_group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handles all text messages sent in the admin group (BUG_FEATURE_GROUP).
+    Used for multi-step admin flows: maintenance message, broadcast message/buttons.
+    """
+    chat_id = update.effective_chat.id
+    if chat_id != BUG_FEATURE_GROUP_ID:
+        return ADMIN_DASHBOARD
+
+    pending = _admin_pending.get(chat_id, {})
+    step    = pending.get("step", "")
+    raw     = (update.message.text or "").strip() if update.message else ""
+
+    # --- Maintenance message input ---
+    if step == "maintenance_msg_wait":
+        asyncio.create_task(auto_delete_msg(update.message, delay=10))
+        if not raw:
+            msg = await update.message.reply_text("Message cannot be empty. Please send the maintenance message text.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return ADMIN_MAINTENANCE_MSG
+        save_maintenance_message(raw)
+        _admin_pending.pop(chat_id, None)
+        msg = await update.message.reply_text(
+            "✅ Maintenance message saved successfully!",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back to Maintenance", callback_data="adm_maintenance"),
+            ]]),
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=60))
+        return ADMIN_DASHBOARD
+
+    # --- Broadcast: specific user ID ---
+    if step == "adm_bc_specific_id_wait":
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        try:
+            target_id = int(raw)
+        except ValueError:
+            msg = await update.message.reply_text("Invalid user ID. Please send a numeric Telegram User ID.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return ADMIN_BROADCAST_MSG
+        _admin_pending[chat_id] = {
+            "step":       "adm_bc_msg_wait",
+            "mode":       "specific",
+            "target_tid": target_id,
+        }
+        msg = await update.message.reply_text(
+            f"User ID: `{target_id}`\n\nNow send the message you want to deliver to this user.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return ADMIN_BROADCAST_MSG
+
+    # --- Broadcast: receive the actual message (any media type) ---
+    if step == "adm_bc_msg_wait":
+        pending["bc_chat_id"]     = update.message.chat_id
+        pending["bc_msg_id"]      = update.message.message_id
+        pending["inline_buttons"] = pending.get("inline_buttons", [])
+        _admin_pending[chat_id]   = pending
+        mode       = pending.get("mode", "public")
+        has_inline = len(pending["inline_buttons"]) > 0
+        lbl        = "Specific user broadcast" if mode == "specific" else "Public broadcast"
+        msg = await update.message.reply_text(
+            f"✅ *{lbl} message received.*\n"
+            f"Inline buttons: {len(pending['inline_buttons'])}/5\n\n"
+            "Choose an action:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_bc_menu_kb(mode, has_inline=has_inline),
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=300))
+        return ADMIN_BROADCAST_MSG
+
+    # --- Broadcast: inline button name ---
+    if step == "adm_bc_inline_name_wait":
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw:
+            msg = await update.message.reply_text("Button name cannot be empty. Please try again.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return ADMIN_BROADCAST_MSG
+        pending["inline_pending_name"] = raw
+        pending["step"]                = "adm_bc_inline_url_wait"
+        _admin_pending[chat_id]        = pending
+        msg = await update.message.reply_text(
+            f"Button name: *{raw}*\n\nNow send the URL for this button.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=120))
+        return ADMIN_BROADCAST_MSG
+
+    # --- Broadcast: inline button URL ---
+    if step == "adm_bc_inline_url_wait":
+        asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        url = raw
+        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("t.me")):
+            msg = await update.message.reply_text(
+                "Invalid URL. Please send a valid link starting with http://, https://, or t.me"
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return ADMIN_BROADCAST_MSG
+        buttons  = pending.get("inline_buttons", [])
+        btn_name = pending.pop("inline_pending_name", "Button")
+        if len(buttons) < 5:
+            buttons.append({"text": btn_name, "url": url})
+        pending["inline_buttons"] = buttons
+        pending["step"]           = "adm_bc_msg_wait"
+        _admin_pending[chat_id]   = pending
+        mode = pending.get("mode", "public")
+        msg  = await update.message.reply_text(
+            f"✅ Inline button added: *{btn_name}*\nTotal: {len(buttons)}/5\n\nChoose an action:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_bc_menu_kb(mode, has_inline=True),
+        )
+        asyncio.create_task(auto_delete_msg(msg, delay=300))
+        return ADMIN_BROADCAST_MSG
+
+    return ADMIN_DASHBOARD
+
 
 # ---------------------------------------------------------------------------
 # User Main Menu Callbacks
@@ -1750,6 +2199,32 @@ def main() -> None:
                 ),
                 CallbackQueryHandler(admin_faq_list_callback, pattern="^adm_faq$"),
             ],
+            ADMIN_MAINTENANCE_MSG: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.Chat(BUG_FEATURE_GROUP_ID),
+                    admin_group_message_handler,
+                ),
+                CallbackQueryHandler(adm_maintenance_cb, pattern="^adm_maintenance$"),
+                CallbackQueryHandler(admin_callback, pattern="^adm_back_dash$"),
+            ],
+            ADMIN_BROADCAST: [
+                CallbackQueryHandler(adm_bc_public_cb,   pattern="^adm_bc_public$"),
+                CallbackQueryHandler(adm_bc_specific_cb, pattern="^adm_bc_specific$"),
+                CallbackQueryHandler(admin_callback,     pattern="^adm_back_dash$"),
+            ],
+            ADMIN_BROADCAST_MSG: [
+                # Any message type: text, photo, video, voice, document, sticker, etc.
+                MessageHandler(
+                    (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.VOICE |
+                     filters.Document.ALL | filters.Sticker.ALL) &
+                    ~filters.COMMAND & filters.Chat(BUG_FEATURE_GROUP_ID),
+                    admin_group_message_handler,
+                ),
+                CallbackQueryHandler(adm_bc_add_inline_cb, pattern="^adm_bc_add_inline_"),
+                CallbackQueryHandler(adm_bc_send_cb,       pattern="^adm_bc_send_"),
+                CallbackQueryHandler(adm_broadcast_cb,     pattern="^adm_broadcast$"),
+                CallbackQueryHandler(admin_callback,       pattern="^adm_back_dash$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         allow_reentry=True,
@@ -1766,7 +2241,7 @@ def main() -> None:
     app.add_handler(group_ignore)
     app.add_error_handler(error_handler)
 
-    logger.info("BlockVeil Support Bot v4 starting...")
+    logger.info("BlockVeil Support Bot v4 (Maintenance + Broadcast) starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
