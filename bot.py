@@ -1,20 +1,22 @@
 """
-BlockVeil Support Bot v3
+BlockVeil Support Bot v4
 ========================
-Changes in v3:
-  - Bot ignores ALL group messages/commands EXCEPT /start in BUG_FEATURE_GROUP (admin dashboard)
-  - All user-facing text is full English
-  - Admin dashboard (/start in BUG_FEATURE_GROUP): 9-button panel
-      User Info, Maintenance, Broadcast, User Control, Statistics,
-      Product, FAQ, Ticket Info, Backup
-  - Product Manager: add / edit / remove products dynamically
-      Products appear as selectable buttons inside "Need Support" and "Report Bug" flows
-  - SQLite: users, tickets, products tables
+Changes in v4:
+  - Attachment screen: only "Skip" shown initially; "Done (Next)" appears only after
+    at least one attachment has been received
+  - One active ticket per user: a user cannot start a new ticket while one is in progress
+    (tracked via active_tickets table; cleared on submit or /cancel)
+  - Admin FAQ Manager: full add / edit / remove FAQ entries stored in DB;
+    user-facing FAQ reads from DB dynamically
+  - Statistics page: added "Download All Users" button -> sends a CSV file
+    containing username + user_id for every registered user
 
 Deploy: Railway (Procfile -> worker: python bot.py)
 Env vars: BOT_TOKEN, SUPPORT_GROUP_ID, BUG_FEATURE_GROUP_ID, DB_PATH (optional)
 """
 
+import csv
+import io
 import os
 import sqlite3
 import logging
@@ -80,7 +82,13 @@ DB_PATH            = os.environ.get("DB_PATH", "blockveil_support.db")
     ADMIN_PRODUCT_ADD_NAME,
     ADMIN_PRODUCT_DETAIL,
     ADMIN_PRODUCT_EDIT_NAME,
-) = range(20, 25)
+    ADMIN_FAQ_LIST,
+    ADMIN_FAQ_ADD_Q,
+    ADMIN_FAQ_ADD_A,
+    ADMIN_FAQ_DETAIL,
+    ADMIN_FAQ_EDIT_Q,
+    ADMIN_FAQ_EDIT_A,
+) = range(20, 31)
 
 TYPE_SUPPORT = "support"
 TYPE_BUG     = "bug"
@@ -138,6 +146,20 @@ def init_db() -> None:
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 name       TEXT    NOT NULL UNIQUE,
                 created_at TEXT    NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS faq (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                question   TEXT    NOT NULL,
+                answer     TEXT    NOT NULL,
+                created_at TEXT    NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS active_tickets (
+                user_id    INTEGER PRIMARY KEY,
+                started_at TEXT    NOT NULL
             )
         """)
         conn.commit()
@@ -277,6 +299,87 @@ def get_product_by_id(product_id: int):
     with get_db() as conn:
         return conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
 
+
+# --- Active ticket lock helpers ---
+def set_active_ticket(user_id: int) -> None:
+    """Mark user as having an in-progress ticket."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO active_tickets (user_id, started_at)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET started_at = excluded.started_at
+        """, (user_id, now_iso))
+        conn.commit()
+
+
+def clear_active_ticket(user_id: int) -> None:
+    """Remove the in-progress ticket lock for this user."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM active_tickets WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def has_active_ticket(user_id: int) -> bool:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM active_tickets WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row is not None
+
+
+# --- FAQ helpers ---
+def get_faqs():
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM faq ORDER BY id ASC").fetchall()
+
+
+def get_faq_by_id(faq_id: int):
+    with get_db() as conn:
+        return conn.execute("SELECT * FROM faq WHERE id = ?", (faq_id,)).fetchone()
+
+
+def add_faq(question: str, answer: str) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO faq (question, answer, created_at) VALUES (?, ?, ?)",
+            (question, answer, now_iso),
+        )
+        conn.commit()
+
+
+def edit_faq(faq_id: int, question: str, answer: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE faq SET question = ?, answer = ? WHERE id = ?",
+            (question, answer, faq_id),
+        )
+        conn.commit()
+
+
+def delete_faq(faq_id: int) -> None:
+    with get_db() as conn:
+        conn.execute("DELETE FROM faq WHERE id = ?", (faq_id,))
+        conn.commit()
+
+
+# --- CSV export helper ---
+def export_users_csv() -> bytes:
+    """Return a UTF-8 CSV of all users as bytes: username, user_id, full_name, joined_at."""
+    users = get_all_users()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["username", "user_id", "full_name", "joined_at"])
+    for u in users:
+        writer.writerow([
+            f"@{u['username']}" if u['username'] else "",
+            u['user_id'],
+            u['full_name'],
+            u['joined_at'][:19].replace("T", " "),
+        ])
+    return buf.getvalue().encode("utf-8")
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -348,7 +451,15 @@ def make_next_keyboard(cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("➡️  Next", callback_data=cb)]])
 
 
+def make_skip_only_keyboard() -> InlineKeyboardMarkup:
+    """Shown before any attachment is received: only Skip."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭️  Skip", callback_data="skip_attachment"),
+    ]])
+
+
 def make_skip_done_keyboard() -> InlineKeyboardMarkup:
+    """Shown after at least one attachment is received: Skip + Done."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("⏭️  Skip",        callback_data="skip_attachment"),
         InlineKeyboardButton("✅  Done (Next)", callback_data="done_attachment"),
@@ -422,6 +533,28 @@ def make_product_detail_keyboard(product_id: int) -> InlineKeyboardMarkup:
 
 def make_admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️  Back to Dashboard", callback_data="adm_back_dash")]])
+
+
+def make_faq_list_keyboard() -> InlineKeyboardMarkup:
+    """All FAQ entries as buttons + Add New + Back."""
+    rows = []
+    for f in get_faqs():
+        short_q = f["question"][:40] + ("..." if len(f["question"]) > 40 else "")
+        rows.append([InlineKeyboardButton(
+            f"❓  {short_q}",
+            callback_data=f"adm_faq_detail_{f['id']}"
+        )])
+    rows.append([InlineKeyboardButton("➕  Add New FAQ",  callback_data="adm_faq_add")])
+    rows.append([InlineKeyboardButton("⬅️  Back",         callback_data="adm_back_dash")])
+    return InlineKeyboardMarkup(rows)
+
+
+def make_faq_detail_keyboard(faq_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️  Edit",   callback_data=f"adm_faq_edit_{faq_id}"),
+         InlineKeyboardButton("🗑️  Remove", callback_data=f"adm_faq_remove_{faq_id}")],
+        [InlineKeyboardButton("⬅️  Back",   callback_data="adm_faq")],
+    ])
 
 # ---------------------------------------------------------------------------
 # /start  (routes by chat type)
@@ -537,8 +670,30 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"💡 Feature Reqs:   {s['feature']}\n\n"
             f"*Recent Tickets:*\n{recent_text}",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=make_admin_back_keyboard(),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥  Download All Users (CSV)", callback_data="adm_download_users")],
+                [InlineKeyboardButton("⬅️  Back to Dashboard", callback_data="adm_back_dash")],
+            ]),
         )
+        return ADMIN_DASHBOARD
+
+    # --- Download All Users CSV ---
+    if data == "adm_download_users":
+        users = get_all_users()
+        if not users:
+            await query.answer("No users to export.", show_alert=True)
+            return ADMIN_DASHBOARD
+        csv_bytes = export_users_csv()
+        now_str   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        filename  = f"blockveil_users_{now_str}.csv"
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=io.BytesIO(csv_bytes),
+            filename=filename,
+            caption=f"👥 *All Users Export*\n{len(users)} users | {now_str} UTC",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await query.answer("CSV sent above.", show_alert=False)
         return ADMIN_DASHBOARD
 
     # --- Ticket Info ---
@@ -595,15 +750,18 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ADMIN_DASHBOARD
 
-    # --- FAQ (admin view) ---
+    # --- FAQ Manager (routes to ADMIN_FAQ_LIST state) ---
     if data == "adm_faq":
+        faqs  = get_faqs()
+        count = len(faqs)
         await query.edit_message_text(
-            "❓ *FAQ Manager*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            "FAQ editing will be available in the next update.",
+            f"❓ *FAQ Manager*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Total FAQ entries: {count}\n\n"
+            "Tap an entry to edit or remove it, or add a new one.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=make_admin_back_keyboard(),
+            reply_markup=make_faq_list_keyboard(),
         )
-        return ADMIN_DASHBOARD
+        return ADMIN_FAQ_LIST
 
     # --- Backup ---
     if data == "adm_backup":
@@ -790,6 +948,193 @@ async def admin_product_edit_name(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_PRODUCT_LIST
 
 # ---------------------------------------------------------------------------
+# Admin FAQ Manager Handlers
+# ---------------------------------------------------------------------------
+
+async def admin_faq_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles buttons on the FAQ list screen."""
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    if data == "adm_back_dash":
+        return await admin_callback(update, context)
+
+    # Show FAQ list (re-render)
+    if data == "adm_faq":
+        faqs = get_faqs()
+        await query.edit_message_text(
+            f"❓ *FAQ Manager*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Total FAQ entries: {len(faqs)}\n\n"
+            "Tap an entry to edit or remove it, or add a new one.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=make_faq_list_keyboard(),
+        )
+        return ADMIN_FAQ_LIST
+
+    # Start adding a new FAQ
+    if data == "adm_faq_add":
+        context.user_data.pop("new_faq_question", None)
+        await query.edit_message_text(
+            "➕ *Add New FAQ*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Step 1 of 2: Send the *question* text.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="adm_faq")
+            ]]),
+        )
+        return ADMIN_FAQ_ADD_Q
+
+    # View FAQ detail
+    if data.startswith("adm_faq_detail_"):
+        fid  = int(data.split("_")[-1])
+        faq  = get_faq_by_id(fid)
+        if not faq:
+            await query.edit_message_text("FAQ not found.", reply_markup=make_faq_list_keyboard())
+            return ADMIN_FAQ_LIST
+        await query.edit_message_text(
+            f"❓ *FAQ Entry*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"*Q:* {faq['question']}\n\n"
+            f"*A:* {faq['answer']}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=make_faq_detail_keyboard(fid),
+        )
+        return ADMIN_FAQ_DETAIL
+
+    return ADMIN_FAQ_LIST
+
+
+async def admin_faq_add_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin sends the question text for a new FAQ."""
+    q = update.message.text.strip()
+    if not q:
+        await update.message.reply_text("Question cannot be empty. Please try again.")
+        return ADMIN_FAQ_ADD_Q
+    context.user_data["new_faq_question"] = q
+    await update.message.reply_text(
+        f"✅ *Question saved.*\n\n_{q}_\n\n"
+        "Step 2 of 2: Now send the *answer* text.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="adm_faq")
+        ]]),
+    )
+    return ADMIN_FAQ_ADD_A
+
+
+async def admin_faq_add_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin sends the answer text, completing the new FAQ entry."""
+    a = update.message.text.strip()
+    q = context.user_data.pop("new_faq_question", None)
+    if not a or not q:
+        await update.message.reply_text("Something went wrong. Please start over.")
+        return ADMIN_FAQ_LIST
+    add_faq(q, a)
+    faqs = get_faqs()
+    await update.message.reply_text(
+        f"✅ *FAQ Added!*\n\n*Q:* {q}\n*A:* {a}\n\n"
+        f"Total FAQ entries: {len(faqs)}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❓  Back to FAQ List", callback_data="adm_faq")],
+            [InlineKeyboardButton("🏠  Dashboard",        callback_data="adm_back_dash")],
+        ]),
+    )
+    return ADMIN_FAQ_LIST
+
+
+async def admin_faq_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles Edit / Remove on a specific FAQ entry."""
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    # Back to FAQ list
+    if data == "adm_faq":
+        faqs = get_faqs()
+        await query.edit_message_text(
+            f"❓ *FAQ Manager*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Total FAQ entries: {len(faqs)}\n\n"
+            "Tap an entry to edit or remove it, or add a new one.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=make_faq_list_keyboard(),
+        )
+        return ADMIN_FAQ_LIST
+
+    if data.startswith("adm_faq_edit_"):
+        fid = int(data.split("_")[-1])
+        faq = get_faq_by_id(fid)
+        context.user_data["editing_faq_id"] = fid
+        context.user_data.pop("editing_faq_new_q", None)
+        await query.edit_message_text(
+            f"✏️ *Edit FAQ*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Current Q: _{faq['question']}_\n\n"
+            "Step 1 of 2: Send the new *question* (or send the same to keep it).",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="adm_faq")
+            ]]),
+        )
+        return ADMIN_FAQ_EDIT_Q
+
+    if data.startswith("adm_faq_remove_"):
+        fid  = int(data.split("_")[-1])
+        faq  = get_faq_by_id(fid)
+        q_preview = faq["question"][:60] if faq else "Unknown"
+        delete_faq(fid)
+        faqs = get_faqs()
+        await query.edit_message_text(
+            f"🗑️ *FAQ Removed.*\n\n_{q_preview}_\n\n"
+            f"Remaining entries: {len(faqs)}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=make_faq_list_keyboard(),
+        )
+        return ADMIN_FAQ_LIST
+
+    return ADMIN_FAQ_DETAIL
+
+
+async def admin_faq_edit_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin sends the new question text when editing a FAQ."""
+    q = update.message.text.strip()
+    if not q:
+        await update.message.reply_text("Question cannot be empty. Please try again.")
+        return ADMIN_FAQ_EDIT_Q
+    context.user_data["editing_faq_new_q"] = q
+    fid = context.user_data.get("editing_faq_id")
+    faq = get_faq_by_id(fid) if fid else None
+    await update.message.reply_text(
+        f"✅ *New question saved.*\n\n_{q}_\n\n"
+        f"Current answer: _{faq['answer'] if faq else 'N/A'}_\n\n"
+        "Step 2 of 2: Send the new *answer* (or send the same to keep it).",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel", callback_data="adm_faq")
+        ]]),
+    )
+    return ADMIN_FAQ_EDIT_A
+
+
+async def admin_faq_edit_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin sends the new answer, completing the FAQ edit."""
+    a   = update.message.text.strip()
+    fid = context.user_data.pop("editing_faq_id", None)
+    q   = context.user_data.pop("editing_faq_new_q", None)
+    if not a or not fid or not q:
+        await update.message.reply_text("Something went wrong. Please start over.")
+        return ADMIN_FAQ_LIST
+    edit_faq(fid, q, a)
+    await update.message.reply_text(
+        f"✅ *FAQ Updated!*\n\n*Q:* {q}\n*A:* {a}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❓  Back to FAQ List", callback_data="adm_faq")],
+            [InlineKeyboardButton("🏠  Dashboard",        callback_data="adm_back_dash")],
+        ]),
+    )
+    return ADMIN_FAQ_LIST
+
+# ---------------------------------------------------------------------------
 # User Main Menu Callbacks
 # ---------------------------------------------------------------------------
 
@@ -799,8 +1144,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     data = query.data
 
     if data == "menu_support":
-        products = get_products()
-        label = "BlockVeil App" if not products else "your product"
+        if has_active_ticket(query.from_user.id):
+            await query.answer(
+                "You already have an active ticket in progress. "
+                "Please submit or cancel it before creating a new one.",
+                show_alert=True,
+            )
+            return MAIN_MENU
+        set_active_ticket(query.from_user.id)
         await query.edit_message_text(
             "🛟 *Need Support*\n\nWhich product do you need help with?",
             parse_mode=ParseMode.MARKDOWN,
@@ -809,6 +1160,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return SELECT_APP
 
     elif data == "menu_bug":
+        if has_active_ticket(query.from_user.id):
+            await query.answer(
+                "You already have an active ticket in progress. "
+                "Please submit or cancel it before creating a new one.",
+                show_alert=True,
+            )
+            return MAIN_MENU
+        set_active_ticket(query.from_user.id)
         await query.edit_message_text(
             "🐛 *Report a Bug*\n\nWhich product has the bug?",
             parse_mode=ParseMode.MARKDOWN,
@@ -817,6 +1176,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return SELECT_APP
 
     elif data == "menu_feature":
+        if has_active_ticket(query.from_user.id):
+            await query.answer(
+                "You already have an active ticket in progress. "
+                "Please submit or cancel it before creating a new one.",
+                show_alert=True,
+            )
+            return MAIN_MENU
+        set_active_ticket(query.from_user.id)
         context.user_data["ticket_type"] = TYPE_FEATURE
         context.user_data["app_name"]    = "BlockVeil"
         await query.edit_message_text(
@@ -840,18 +1207,16 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return MAIN_MENU
 
     elif data == "menu_faq":
+        faqs = get_faqs()
+        if faqs:
+            lines = []
+            for f in faqs:
+                lines.append(f"*Q: {f['question']}*\nA: {f['answer']}")
+            faq_body = "\n\n".join(lines)
+        else:
+            faq_body = "_No FAQ entries yet. Check back soon!_"
         await query.edit_message_text(
-            "❓ *FAQ*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            "*Q: What is BlockVeil?*\n"
-            "A: BlockVeil is a privacy-focused tech venture providing encrypted tools and crypto education.\n\n"
-            "*Q: How long does support take?*\n"
-            "A: Our team typically responds within 24 to 48 hours.\n\n"
-            "*Q: Is there a reward for bug reports?*\n"
-            "A: Yes! Valid bug reporters receive recognition and credits.\n\n"
-            "*Q: Is my data secure?*\n"
-            "A: Yes. All data is protected with AES-256-GCM encryption.\n\n"
-            "*Q: How do I cancel a flow?*\n"
-            "A: Use /cancel at any time to exit the current flow.",
+            f"❓ *FAQ*\n━━━━━━━━━━━━━━━━━━━━\n\n{faq_body}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=make_back_main_keyboard(),
         )
@@ -1031,13 +1396,15 @@ async def receive_description(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def to_attachment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    # Reset attachment list so count is fresh
+    context.user_data["attachments"] = []
     await query.edit_message_text(
         "📎 *Attachments (Optional)*\n\n"
-        "Send photos, videos, or voice messages now.\n\n"
+        "Send photos, videos, voice messages, or files now.\n\n"
         "You can send multiple files. When done, tap *Done (Next)*.\n"
         "To skip, tap *Skip*.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=make_skip_done_keyboard(),
+        reply_markup=make_skip_only_keyboard(),   # No "Done" yet
     )
     return COLLECT_ATTACHMENT
 
@@ -1060,14 +1427,15 @@ async def collect_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         label = "📄 File"
     else:
         await msg.reply_text(
-            "⚠️ Please send a photo, video, voice message, or file.\nOr tap *Done (Next)*.",
+            "⚠️ Please send a photo, video, voice message, or file.\nOr tap *Skip*.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=make_skip_done_keyboard(),
+            reply_markup=make_skip_only_keyboard(),
         )
         return COLLECT_ATTACHMENT
 
+    # At least 1 attachment exists: show Skip + Done
     await msg.reply_text(
-        f"✅ {label} added! (Total: {len(attachments)})\n\nSend more or tap *Done (Next)*.",
+        f"✅ {label} added! (Total: {len(attachments)})\n\nSend more, or tap *Done (Next)* to continue.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=make_skip_done_keyboard(),
     )
@@ -1126,12 +1494,13 @@ async def bug_feature_describe(update: Update, context: ContextTypes.DEFAULT_TYP
 async def bug_feature_attachment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    context.user_data["attachments"] = []
     await query.edit_message_text(
         "📎 *Attachments (Optional)*\n\n"
         "Send screenshots, videos, or files.\n\n"
         "Tap *Done (Next)* when finished or *Skip* to continue.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=make_skip_done_keyboard(),
+        reply_markup=make_skip_only_keyboard(),   # No "Done" until first file received
     )
     return BUG_FEATURE_COLLECT
 
@@ -1144,6 +1513,7 @@ async def submit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if query.data == "back_main":
+        clear_active_ticket(query.from_user.id)
         context.user_data.clear()
         return await show_main_menu(query)
 
@@ -1195,6 +1565,7 @@ async def submit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await context.bot.send_document(chat_id=target_group, document=fid)
 
         save_ticket(tid, user.id, ticket_type, app_name, description, rating_val)
+        clear_active_ticket(user.id)   # Release the lock
 
         await query.edit_message_text(
             f"✅ *Ticket Submitted Successfully!*\n\n"
@@ -1230,6 +1601,8 @@ async def ignore_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user:
+        clear_active_ticket(update.effective_user.id)
     context.user_data.clear()
     if is_private(update):
         await update.message.reply_text(
@@ -1343,6 +1716,40 @@ def main() -> None:
                 ),
                 CallbackQueryHandler(admin_callback, pattern="^adm_product$"),
             ],
+            ADMIN_FAQ_LIST: [
+                CallbackQueryHandler(admin_faq_list_callback),
+            ],
+            ADMIN_FAQ_ADD_Q: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.Chat(BUG_FEATURE_GROUP_ID),
+                    admin_faq_add_question,
+                ),
+                CallbackQueryHandler(admin_faq_list_callback, pattern="^adm_faq$"),
+            ],
+            ADMIN_FAQ_ADD_A: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.Chat(BUG_FEATURE_GROUP_ID),
+                    admin_faq_add_answer,
+                ),
+                CallbackQueryHandler(admin_faq_list_callback, pattern="^adm_faq$"),
+            ],
+            ADMIN_FAQ_DETAIL: [
+                CallbackQueryHandler(admin_faq_detail_callback),
+            ],
+            ADMIN_FAQ_EDIT_Q: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.Chat(BUG_FEATURE_GROUP_ID),
+                    admin_faq_edit_question,
+                ),
+                CallbackQueryHandler(admin_faq_list_callback, pattern="^adm_faq$"),
+            ],
+            ADMIN_FAQ_EDIT_A: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & filters.Chat(BUG_FEATURE_GROUP_ID),
+                    admin_faq_edit_answer,
+                ),
+                CallbackQueryHandler(admin_faq_list_callback, pattern="^adm_faq$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         allow_reentry=True,
@@ -1359,7 +1766,7 @@ def main() -> None:
     app.add_handler(group_ignore)
     app.add_error_handler(error_handler)
 
-    logger.info("BlockVeil Support Bot v3 starting...")
+    logger.info("BlockVeil Support Bot v4 starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
